@@ -47,12 +47,27 @@ class FamilyService {
         isDependent: dto.isDependent ?? true,
       },
     });
+    await this.syncDependents(userId);
     return { id: m.id };
   }
 
   async remove(userId: string, id: string) {
     await this.prisma.familyMember.deleteMany({ where: { id, userId } });
+    await this.syncDependents(userId);
     return { ok: true };
+  }
+
+  /**
+   * Keep Profile.dependents in lock-step with the family graph so the dependent
+   * count feeds insurance-gap and Early Warning calculations automatically.
+   * Uses updateMany so it's a no-op until the user has a profile (avoids needing
+   * the required, encrypted profile fields just to bump a counter).
+   */
+  private async syncDependents(userId: string) {
+    const dependents = await this.prisma.familyMember.count({
+      where: { userId, isDependent: true },
+    });
+    await this.prisma.profile.updateMany({ where: { userId }, data: { dependents } });
   }
 }
 
