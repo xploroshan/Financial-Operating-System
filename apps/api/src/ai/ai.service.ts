@@ -3,15 +3,14 @@ import { ConfigService } from '@nestjs/config';
 import Anthropic from '@anthropic-ai/sdk';
 import {
   analyzeAllocation,
-  computeNetWorth,
   computeWealthHealth,
   topWealthActions,
   type Allocation,
   type AssetClass,
-  type CurrencyCode,
   type RiskTolerance,
 } from '@lcos/core';
 import { PrismaService } from '../prisma/prisma.service';
+import { FinancialSnapshotService } from '../common/financial-snapshot.service';
 
 export interface CoachMessage {
   role: 'user' | 'assistant';
@@ -50,6 +49,7 @@ export class AiService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
+    private readonly snapshots: FinancialSnapshotService,
   ) {
     const apiKey = this.config.get<string>('ai.apiKey');
     this.model = this.config.get<string>('ai.model') ?? 'claude-sonnet-4-6';
@@ -58,50 +58,26 @@ export class AiService {
 
   /** Build a compact, factual summary of the user's finances for grounding. */
   private async buildContext(userId: string): Promise<string> {
-    const [profile, accounts] = await Promise.all([
-      this.prisma.profile.findUnique({ where: { userId } }),
-      this.prisma.account.findMany({ where: { userId } }),
-    ]);
-    const currency = (profile?.baseCurrency as CurrencyCode) ?? 'INR';
+    const snapshot = await this.snapshots.assemble(userId);
+    const { currency } = snapshot;
 
-    const nw = computeNetWorth(
-      accounts.map((a) => ({
-        balanceMinor: Number(a.balanceMinor),
-        currency: a.currency as CurrencyCode,
-        isLiability: a.isLiability,
-      })),
-      currency,
-    );
-
-    const monthlyExpenses = Number(profile?.monthlyExpensesMinor ?? 0);
-    const annualIncome = Number(profile?.annualIncomeMinor ?? 0);
-    const investments = accounts
-      .filter((a) => a.assetClass === 'equity' || a.assetClass === 'debt')
-      .reduce((s, a) => s + Number(a.balanceMinor), 0);
-
-    const report = computeWealthHealth({
-      age: 35,
-      monthlyExpensesMinor: monthlyExpenses,
-      emergencyFundMinor: accounts
-        .filter((a) => a.assetClass === 'cash')
-        .reduce((s, a) => s + Number(a.balanceMinor), 0),
-      annualIncomeMinor: annualIncome,
-      existingLifeCoverMinor: 0,
-      hasHealthInsurance: false,
-      investmentAssetsMinor: investments,
-      totalAssetsMinor: nw.assets.minor,
-      totalLiabilitiesMinor: nw.liabilities.minor,
-      retirementRequiredCorpusMinor: 0,
-      retirementCorpusGapMinor: 0,
-    });
+    // Score from the *real* snapshot (age, protection, retirement gap) — no hardcoding.
+    const report = computeWealthHealth(FinancialSnapshotService.toScoreInput(snapshot));
     const actions = topWealthActions(report);
 
     const inr = (minor: number) => `${currency} ${(minor / 100).toLocaleString('en-IN')}`;
+    const protection = [
+      snapshot.hasTermCover ? `term life ${inr(snapshot.existingLifeCoverMinor)}` : 'no term life',
+      snapshot.hasHealthInsurance ? 'health insurance' : 'no health insurance',
+    ].join(', ');
     return [
       `Base currency: ${currency}`,
-      `Net worth: ${inr(nw.netWorth.minor)} (assets ${inr(nw.assets.minor)}, liabilities ${inr(nw.liabilities.minor)})`,
-      `Annual income: ${inr(annualIncome)}; monthly expenses: ${inr(monthlyExpenses)}`,
-      `Risk tolerance: ${profile?.riskTolerance ?? 'moderate'}; dependents: ${profile?.dependents ?? 0}`,
+      `Age: ${snapshot.age}`,
+      `Net worth: ${inr(snapshot.netWorthMinor)} (assets ${inr(snapshot.assetsMinor)}, liabilities ${inr(snapshot.liabilitiesMinor)})`,
+      `Annual income: ${inr(snapshot.annualIncomeMinor)}; monthly expenses: ${inr(snapshot.monthlyExpensesMinor)}`,
+      `Risk tolerance: ${snapshot.riskTolerance}; dependents: ${snapshot.dependents}`,
+      `Protection: ${protection}`,
+      `Retirement: required corpus ${inr(snapshot.retirementRequiredCorpusMinor)}, projected gap ${inr(snapshot.retirementCorpusGapMinor)}`,
       `Life Capital Score: ${report.overall}/100 (band ${report.band})`,
       `Sub-scores: ${report.subScores.map((s) => `${s.label} ${s.score}`).join(', ')}`,
       `Top suggested actions: ${actions.map((a) => a.title).join('; ') || 'none — all areas healthy'}`,
